@@ -5,7 +5,7 @@ from pathlib import Path
 import os
 from dotenv import load_dotenv
 import re
-import anthropic
+import openai
 
 load_dotenv()
 
@@ -29,13 +29,16 @@ class ToolCreatorTool(BaseTool):
     }
 
     def __init__(self):
-        self.client = anthropic.Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
+        self.client = openai.OpenAI(
+            api_key=os.getenv('OPENAI_API_KEY'),
+            base_url=os.getenv('OPENAI_API_BASE')
+        )
         self.console = Console()
-        self.tools_dir = Path(__file__).parent.parent / "tools"  # Fixed path
+        self.tools_dir = Path(__file__).parent.parent / "tools"
 
     def _sanitize_filename(self, name: str) -> str:
         """Convert tool name to valid Python filename"""
-        return name + '.py'  # Keep exact name, just add .py
+        return name + '.py'
 
     def _validate_tool_name(self, name: str) -> bool:
         """Validate tool name matches required pattern"""
@@ -44,7 +47,6 @@ class ToolCreatorTool(BaseTool):
     def execute(self, **kwargs) -> str:
         description = kwargs.get("description")
 
-        # Create exact same prompt as the original
         prompt = f"""Create a Python tool class that follows our BaseTool interface. The tool should:
 
 1. {description}
@@ -59,11 +61,11 @@ Important:
 Here's the required structure (including imports and format):
 
 ```python
-from tools.base import BaseTool  # This import must be present
-import requests  # Add any other required imports
+from tools.base import BaseTool
+import requests
 
-class ToolName(BaseTool):  # Class name must match name property in uppercase first letter
-    name = "toolname"  # Must match class name in lowercase
+class ToolName(BaseTool):
+    name = "toolname"
     description = '''
     Detailed description here.
     Multiple lines for clarity.
@@ -73,7 +75,7 @@ class ToolName(BaseTool):  # Class name must match name property in uppercase fi
         "properties": {{
             # Required input parameters
         }},
-        "required": []  # List required parameters
+        "required": []
     }}
 
     def execute(self, **kwargs) -> str:
@@ -85,37 +87,32 @@ Generate the complete tool implementation following this exact structure.
 Return ONLY the Python code without any explanation or markdown formatting.
 """
 
-        try:
-            # Get tool implementation from Claude with animation
-            response = self.client.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=4000,
-                temperature=0,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
-            )
+            try:
+        response = self.client.chat.completions.create(
+            model=Config.MODEL,
+            max_tokens=4000,
+            temperature=0,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
 
-            tool_code = response.content[0].text.strip()
+        tool_code = response.choices[0].message.content.strip()
 
-            # Extract tool name from the generated code
-            name_match = re.search(r'name\s*=\s*["\']([a-zA-Z0-9_-]+)["\']', tool_code)
-            if not name_match:
-                return "Error: Could not extract tool name from generated code"
+        name_match = re.search(r'name\s*=\s*["\']([a-zA-Z0-9_-]+)["\']', tool_code)
+        if not name_match:
+            return "Error: Could not extract tool name from generated code"
 
-            tool_name = name_match.group(1)
-            filename = self._sanitize_filename(tool_name)
+        tool_name = name_match.group(1)
+        filename = self._sanitize_filename(tool_name)
 
-            # Ensure the tools directory exists
-            self.tools_dir.mkdir(exist_ok=True)
+        self.tools_dir.mkdir(exist_ok=True)
 
-            # Save tool to file
-            file_path = self.tools_dir / filename
-            with open(file_path, 'w') as f:
-                f.write(tool_code)
+        file_path = self.tools_dir / filename
+        with open(file_path, 'w') as f:
+            f.write(tool_code)
 
-            # Format the response using Panel like the original
-            result = f"""[bold green]✅ Tool created successfully![/bold green]
+        result = f"""[bold green]✅ Tool created successfully![/bold green]
 Tool name: [cyan]{tool_name}[/cyan]
 File created: [cyan]{filename}[/cyan]
 
