@@ -30,11 +30,9 @@ def chat():
         # Create a message with both text and image in correct order
         message_content = [
             {
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/jpeg",  # We should detect this from the image
-                    "data": image_data.split(',')[1] if ',' in image_data else image_data  # Remove data URL prefix if present
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{data.get('media_type', 'image/jpeg')};base64,{image_data.split(',')[1] if ',' in image_data else image_data}"
                 }
             }
         ]
