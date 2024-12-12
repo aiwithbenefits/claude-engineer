@@ -1,5 +1,4 @@
-# ce3.py
-import anthropic
+import openai
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.live import Live
@@ -37,11 +36,14 @@ class Assistant:
     """
 
     def __init__(self):
-        if not getattr(Config, 'ANTHROPIC_API_KEY', None):
-            raise ValueError("No ANTHROPIC_API_KEY found in environment variables")
+        if not getattr(Config, 'OPENAI_API_KEY', None):
+            raise ValueError("No OPENAI_API_KEY found in environment variables")
 
-        # Initialize Anthropics client
-        self.client = anthropic.Anthropic(api_key=Config.ANTHROPIC_API_KEY)
+        # Initialize OpenAI client
+        self.client = openai.OpenAI(
+            api_key=Config.OPENAI_API_KEY,
+            base_url=Config.OPENAI_API_BASE
+        )
 
         self.conversation_history: List[Dict[str, Any]] = []
         self.console = Console()
@@ -272,7 +274,7 @@ class Assistant:
             tool_instance = self._find_tool_instance_in_module(module, tool_name)
 
             if not tool_instance:
-                tool_result = f"Tool not found: {tool_name}"
+                tool_result = f"Error: Tool not found: {tool_name}"
             else:
                 # Execute the tool with the provided input
                 try:
@@ -282,9 +284,9 @@ class Assistant:
                 except Exception as exec_err:
                     tool_result = f"Error executing tool '{tool_name}': {str(exec_err)}"
         except ImportError:
-            tool_result = f"Failed to import tool: {tool_name}"
+            tool_result = f"Error: Failed to import tool: {tool_name}"
         except Exception as e:
-            tool_result = f"Error executing tool: {str(e)}"
+            tool_result = f"Error: executing tool: {str(e)}"
 
         # Display tool usage with proper handling of structured data
         self._display_tool_usage(tool_name, tool_input, 
@@ -335,21 +337,55 @@ class Assistant:
         Handles both text-only and multimodal messages.
         """
         try:
-            response = self.client.messages.create(
+            # Convert tools to OpenAI format
+            openai_tools = []
+            for tool in self.tools:
+                openai_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool['name'],
+                        "description": tool['description'],
+                        "parameters": tool['input_schema']
+                    }
+                })
+
+            # Convert conversation history to OpenAI format
+            openai_messages = []
+            for message in self.conversation_history:
+                if message['role'] == 'user':
+                    openai_messages.append({
+                        "role": "user",
+                        "content": message['content']
+                    })
+                elif message['role'] == 'assistant':
+                    openai_messages.append({
+                        "role": "assistant",
+                        "content": message['content']
+                    })
+                elif message['role'] == 'tool':
+                    openai_messages.append({
+                        "role": "tool",
+                        "content": message['content'],
+                        "tool_call_id": message['tool_call_id']
+                    })
+
+            response = self.client.chat.completions.create(
                 model=Config.MODEL,
                 max_tokens=min(
                     Config.MAX_TOKENS,
                     Config.MAX_CONVERSATION_TOKENS - self.total_tokens_used
                 ),
                 temperature=self.temperature,
-                tools=self.tools,
-                messages=self.conversation_history,
-                system=f"{SystemPrompts.DEFAULT}\n\n{SystemPrompts.TOOL_USAGE}"
+                tools=openai_tools,
+                messages=[
+                    {"role": "system", "content": f"{SystemPrompts.DEFAULT}\n\n{SystemPrompts.TOOL_USAGE}"},
+                    *openai_messages
+                ]
             )
 
             # Update token usage based on response usage
             if hasattr(response, 'usage') and response.usage:
-                message_tokens = response.usage.input_tokens + response.usage.output_tokens
+                message_tokens = response.usage.total_tokens
                 self.total_tokens_used += message_tokens
                 self._display_token_usage(response.usage)
 
@@ -357,35 +393,39 @@ class Assistant:
                 self.console.print("\n[bold red]Token limit reached! Please reset the conversation.[/bold red]")
                 return "Token limit reached! Please type 'reset' to start a new conversation."
 
-            if response.stop_reason == "tool_use":
+            if response.choices[0].finish_reason == "tool_calls":
                 self.console.print("\n[bold yellow]  Handling Tool Use...[/bold yellow]\n")
 
                 tool_results = []
-                if getattr(response, 'content', None) and isinstance(response.content, list):
+                if getattr(response.choices[0], 'message', None) and response.choices[0].message.tool_calls:
                     # Execute each tool in the response content
-                    for content_block in response.content:
-                        if content_block.type == "tool_use":
-                            result = self._execute_tool(content_block)
-                            
-                            # Handle structured data (like image blocks) vs text
-                            if isinstance(result, (list, dict)):
-                                tool_results.append({
-                                    "type": "tool_result",
-                                    "tool_use_id": content_block.id,
-                                    "content": result  # Keep structured data intact
-                                })
-                            else:
-                                # Convert text results to proper content blocks
-                                tool_results.append({
-                                    "type": "tool_result",
-                                    "tool_use_id": content_block.id,
-                                    "content": [{"type": "text", "text": str(result)}]
-                                })
+                    for tool_call in response.choices[0].message.tool_calls:
+                        function_name = tool_call.function.name
+                        function_args = json.loads(tool_call.function.arguments)
+                        result = self._execute_tool(tool_call)
+                        
+                        # Handle structured data (like image blocks) vs text
+                        if isinstance(result, (list, dict)):
+                            tool_results.append({
+                                "tool_call_id": tool_call.id,
+                                "role": "tool",
+                                "name": function_name,
+                                "content": result  # Keep structured data intact
+                            })
+                        else:
+                            # Convert text results to proper content blocks
+                            tool_results.append({
+                                "tool_call_id": tool_call.id,
+                                "role": "tool",
+                                "name": function_name,
+                                "content": result
+                            })
 
                     # Append tool usage to conversation and continue
                     self.conversation_history.append({
                         "role": "assistant",
-                        "content": response.content
+                        "content": None,
+                        "tool_calls": response.choices[0].message.tool_calls
                     })
                     self.conversation_history.append({
                         "role": "user",
@@ -398,13 +438,12 @@ class Assistant:
                     return "Error: No tool content received"
 
             # Final assistant response
-            if (getattr(response, 'content', None) and 
-                isinstance(response.content, list) and 
-                response.content):
-                final_content = response.content[0].text
+            if (getattr(response.choices[0], 'message', None) and 
+                response.choices[0].message.content):
+                final_content = response.choices[0].message.content
                 self.conversation_history.append({
                     "role": "assistant",
-                    "content": response.content
+                    "content": final_content
                 })
                 return final_content
             else:
@@ -427,7 +466,7 @@ class Assistant:
                 return "Tools refreshed successfully!"
             elif user_input.lower() == 'reset':
                 self.reset()
-                return "Conversation reset!"
+                                return "Conversation reset!"
             elif user_input.lower() == 'quit':
                 return "Goodbye!"
 
@@ -472,7 +511,6 @@ Available tools:
         self.console.print(Markdown(welcome_text))
         self.display_available_tools()
 
-
 def main():
     """
     Entry point for the assistant CLI loop.
@@ -485,7 +523,7 @@ def main():
         assistant = Assistant()
     except ValueError as e:
         console.print(f"[bold red]Error:[/bold red] {str(e)}")
-        console.print("Please ensure ANTHROPIC_API_KEY is set correctly.")
+        console.print("Please ensure OPENAI_API_KEY and OPENAI_API_BASE are set correctly.")
         return
 
     welcome_text = """
@@ -523,7 +561,6 @@ Available tools:
             continue
         except EOFError:
             break
-
 
 if __name__ == "__main__":
     main()
